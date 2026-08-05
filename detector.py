@@ -236,3 +236,125 @@ def find_signals(df: pd.DataFrame, P: Params, ticker: str = "") -> list:
             rB=rB, rC=rC, p2_i=p2, p2_date=df.index[p2], conds=conds,
         ))
     return sigs
+
+
+# ------------------------------------------------- diagnostico de embudo
+def funnel(df: pd.DataFrame, P: Params) -> dict:
+    """Cuenta cuantos candidatos sobreviven cada filtro, en orden.
+    Sirve para ver DONDE muere la estrategia antes de relajar nada."""
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    l = df["Low"].to_numpy(float)
+    c = df["Close"].to_numpy(float)
+    n = len(df)
+    A = atr(h, l, c, P.atr_n)
+    f = sma(c, P.ma_fast)
+    s = sma(c, P.ma_slow)
+    s50 = sma(c, P.sent_sma)
+    ph_idx, pl_idx = pivots(h, l, P.pivot_k)
+
+    keys = ["1_techo_doble_y_ruptura_valle", "2_mas_violencia",
+            "3_mas_directriz_rota", "4_mas_resistencia_relevante",
+            "5_mas_sentimiento_proxy", "6_mas_plana_ABC_ratios",
+            "7_mas_C_en_zona_medias", "8_mas_barra_de_giro_SENAL"]
+    cnt = {k: 0 for k in keys}
+
+    for idx in range(1, len(ph_idx)):
+        p1, p2 = int(ph_idx[idx - 1]), int(ph_idx[idx])
+        if h[p2] <= h[p1] or np.isnan(A[p2]):
+            continue
+        V = l[p1:p2 + 1].min()
+        end = min(p2 + 1 + P.leg_max_bars, n)
+        below = np.where(c[p2 + 1:end] < V)[0]
+        if len(below) == 0:
+            continue
+        b = p2 + 1 + below[0]
+        if np.isnan(A[b]):
+            continue
+        cnt[keys[0]] += 1
+
+        if not ((h[b] - l[b]) >= P.viol_atr * A[b]
+                or (V - c[b]) >= 0.25 * A[b]):
+            continue
+        cnt[keys[1]] += 1
+
+        line = fit_directriz(l, pl_idx, b, P, A[b])
+        dir_ok = False
+        if line is not None:
+            slope, inter = line
+            dir_ok = slope > 0 and any(
+                c[j] < slope * j + inter - P.line_break_atr * A[j]
+                for j in range(b, min(b + 4, n)) if not np.isnan(A[j])
+            )
+        if not dir_ok:
+            continue
+        cnt[keys[2]] += 1
+
+        lo_i, hi_i = max(0, p2 - P.res_look), p2 - P.res_excl
+        res_ok = False
+        if hi_i - lo_i >= P.res_min_hist:
+            hh = h[lo_i:hi_i].max()
+            res_ok = (hh - P.res_tol_atr * A[p2] <= h[p2]
+                      <= hh + P.res_over_atr * A[p2])
+        if P.require_res and not res_ok:
+            continue
+        cnt[keys[3]] += 1
+
+        sent_ok = (p2 - P.sent_slope_bars >= 0
+                   and not np.isnan(s50[p2]) and c[p2] > s50[p2]
+                   and s50[p2] > s50[p2 - P.sent_slope_bars])
+        if P.require_sent and not sent_ok:
+            continue
+        cnt[keys[4]] += 1
+
+        # pauta plana A-B-C dentro de las 60 barras tras la ruptura
+        abc = None
+        for zi in pl_idx[(pl_idx > b) & (pl_idx <= b + 60)]:
+            zi = int(zi)
+            if l[zi] >= V:
+                continue
+            for ai in ph_idx[(ph_idx > zi) & (ph_idx <= b + 60)][:2]:
+                ai = int(ai)
+                bls = pl_idx[(pl_idx > ai) & (pl_idx <= b + 60)]
+                if len(bls) == 0:
+                    continue
+                bi = int(bls[0])
+                chs = ph_idx[(ph_idx > bi)
+                             & (ph_idx <= b + 60 + P.turn_within)]
+                if len(chs) == 0:
+                    continue
+                ci = int(chs[0])
+                Alen, Blen = h[ai] - l[zi], h[ai] - l[bi]
+                if Alen <= 0 or Blen <= 0:
+                    continue
+                rB = Blen / Alen
+                rC = (h[ci] - l[bi]) / Blen
+                if (P.b_lo - P.ratio_tol <= rB <= P.b_hi + P.ratio_tol
+                        and P.c_lo - P.ratio_tol <= rC <= P.c_hi + P.ratio_tol
+                        and h[ci] < h[p2]):
+                    abc = (zi, ai, bi, ci)
+                    break
+            if abc:
+                break
+        if not abc:
+            continue
+        cnt[keys[5]] += 1
+        zi, ai, bi, ci = abc
+
+        ma_ok = (not np.isnan(f[ci]) and not np.isnan(s[ci])
+                 and min(f[ci], s[ci]) - P.ma_tol_atr * A[ci] <= h[ci]
+                 <= max(f[ci], s[ci]) + P.ma_tol_atr * A[ci])
+        if P.require_ma and not ma_ok:
+            continue
+        cnt[keys[6]] += 1
+
+        trig = False
+        for t in range(ci + P.pivot_k, min(ci + P.turn_within + 1, n)):
+            if h[ci + 1:t + 1].max() > h[ci] + 0.1 * A[t]:
+                break
+            if c[t] < o[t] and c[t] < l[t - 1] and c[t] > l[bi]:
+                trig = True
+                break
+        if trig:
+            cnt[keys[7]] += 1
+    return cnt

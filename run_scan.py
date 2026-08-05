@@ -18,7 +18,7 @@ import os
 import pandas as pd
 
 from config import Params
-from detector import find_signals
+from detector import find_signals, funnel
 from backtest import backtest, resumen
 
 
@@ -65,9 +65,18 @@ def scan_once(args, P: Params, seen: set) -> None:
         if args.backtest:
             trades = backtest(df, sigs, P)
             print(f"\n===== BACKTEST {tk} ({args.tf}, {args.period}) =====")
+            yrs = (df.index[-1] - df.index[0]).days / 365.25
+            print(f"periodo: {df.index[0].date()} -> {df.index[-1].date()}"
+                  f"  ({yrs:.1f} anos, {len(df)} barras)")
+            if yrs > 0:
+                print(f"senales: {len(sigs)}  ->  "
+                      f"{len(sigs)/yrs:.2f} senales/ano")
             print(resumen(trades))
             if not trades.empty:
                 print(trades.to_string(index=False))
+            print("embudo (cuantos candidatos sobreviven cada filtro):")
+            for k, v in funnel(df, P).items():
+                print(f"  {k}: {v}")
             continue
         fresh = [s for s in sigs
                  if (tk, str(s.date)) not in seen and s.i >= len(df) - args.recent]
